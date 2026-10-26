@@ -18,9 +18,20 @@ jobs:
         with:
           gradle-version: 8.7
       - name: Build
-        working-directory: BGRecorder
-        run: gradle assembleDebug
+        run: |
+          APP_BUILD=$(find . -type f -path '*/app/build.gradle.kts' | head -n 1)
+          if [ -z "$APP_BUILD" ]; then
+            echo "app/build.gradle.kts was NOT found. Files in the repository:"
+            find . -not -path './.git/*' | head -60
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$(dirname "$APP_BUILD")")
+          echo "Project folder is: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+          gradle assembleDebug
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/out/"
       - uses: actions/upload-artifact@v4
         with:
           name: BGRecorder-debug-apk
-          path: BGRecorder/app/build/outputs/apk/debug/app-debug.apk
+          path: out/app-debug.apk
