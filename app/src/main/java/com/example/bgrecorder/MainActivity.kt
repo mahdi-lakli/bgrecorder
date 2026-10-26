@@ -4,18 +4,24 @@ import android.Manifest
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-import android.widget.Button
+import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,18 +31,30 @@ import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
 
-    private var status: TextView? = null
-    private var statusText = "Ready"
     private lateinit var appTheme: AppTheme
+    private var statusView: TextView? = null
+    private var recordBtn: ImageButton? = null
+    private var switchBtn: ImageButton? = null
+
+    private var notice: String? = null          // temporary message (updates, permissions)
+    private var shownRecording: Boolean? = null // what the record button currently shows
+    private val ui = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
     private var busy = false
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            refreshState()
+            ui.postDelayed(this, 500)
+        }
+    }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
             if (result.values.all { it }) {
-                sendToService(RecordingService.ACTION_START)
+                afterPermissions()
             } else {
-                setStatus("Camera, microphone and notification permissions are required.")
+                setNotice("Camera, microphone and notification permissions are required.")
             }
         }
 
@@ -44,14 +62,17 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         appTheme = Themes.load(this)
         buildUi()
-
-        // Quietly look for a new version every time the app opens.
-        checkForUpdates(manual = false)
+        checkForUpdates() // quietly looks for a new version every time the app opens
     }
 
     override fun onResume() {
         super.onResume()
-        if (!busy) setStatus(if (RecordingService.isRunning) "Recording..." else "Ready")
+        ui.post(ticker)
+    }
+
+    override fun onPause() {
+        ui.removeCallbacks(ticker)
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -63,51 +84,21 @@ class MainActivity : ComponentActivity() {
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 
-    private fun setStatus(text: String) {
-        statusText = text
-        status?.text = text
+    private fun oval(color: Int) = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
     }
 
-    private fun roundedBackground(fill: Int, radiusDp: Int, strokeColor: Int? = null, strokeDp: Int = 2) =
-        GradientDrawable().apply {
-            cornerRadius = dp(radiusDp).toFloat()
-            setColor(fill)
-            if (strokeColor != null) setStroke(dp(strokeDp), strokeColor)
-        }
-
-    private fun styledButton(label: String, fill: Int, textColor: Int, onClick: () -> Unit) =
-        Button(this).apply {
-            text = label
-            isAllCaps = false
-            textSize = 16f
-            setTextColor(textColor)
-            background = roundedBackground(fill, 24)
-            stateListAnimator = null
-            minHeight = dp(52)
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-                .apply { setMargins(0, dp(6), 0, dp(6)) }
+    private fun circleButton(sizeDp: Int, iconRes: Int, description: String, onClick: () -> Unit) =
+        ImageButton(this).apply {
+            setImageResource(iconRes)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = description
+            setPadding(dp(sizeDp / 4), dp(sizeDp / 4), dp(sizeDp / 4), dp(sizeDp / 4))
+            layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+                .apply { setMargins(dp(14), 0, dp(14), 0) }
             setOnClickListener { onClick() }
         }
-
-    private fun themeChip(option: AppTheme): Button {
-        val selected = option.id == appTheme.id
-        return Button(this).apply {
-            text = (if (selected) "✓ " else "") + option.label
-            isAllCaps = false
-            textSize = 14f
-            setTextColor(option.text)
-            background = roundedBackground(option.background, 20, option.accent, if (selected) 3 else 1)
-            stateListAnimator = null
-            minHeight = dp(48)
-            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
-                .apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }
-            setOnClickListener {
-                Themes.save(this@MainActivity, option)
-                appTheme = option
-                buildUi()
-            }
-        }
-    }
 
     private fun buildUi() {
         val t = appTheme
@@ -121,128 +112,188 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightNavigationBars = !t.isDark
         }
 
+        // Tap the name to change the theme.
         val title = TextView(this).apply {
             text = "BG Recorder"
-            textSize = 30f
+            textSize = 26f
             typeface = Typeface.create("serif", Typeface.BOLD)
             setTextColor(t.text)
             gravity = Gravity.CENTER
+            setOnClickListener {
+                appTheme = Themes.next(appTheme)
+                Themes.save(this@MainActivity, appTheme)
+                buildUi()
+            }
         }
         val version = TextView(this).apply {
-            text = "Version ${Updater.installedVersionName(this@MainActivity)}  ·  ${t.label}"
-            textSize = 13f
+            text = "v${Updater.installedVersionName(this@MainActivity)}"
+            textSize = 12f
             setTextColor(t.text)
-            alpha = 0.7f
+            alpha = 0.55f
             gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, dp(16))
         }
-        status = TextView(this).apply {
-            text = statusText
-            textSize = 17f
+        val status = TextView(this).apply {
+            textSize = 16f
             setTextColor(t.text)
             gravity = Gravity.CENTER
-            background = roundedBackground(t.card, 20)
-            setPadding(dp(16), dp(18), dp(16), dp(18))
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-                .apply { setMargins(0, 0, 0, dp(12)) }
+            setPadding(dp(24), dp(10), dp(24), dp(10))
         }
+        statusView = status
 
-        val themeLabel = TextView(this).apply {
-            text = "Theme"
-            textSize = 15f
-            typeface = Typeface.create("serif", Typeface.BOLD)
-            setTextColor(t.text)
-            setPadding(dp(4), dp(20), 0, dp(4))
-        }
-        fun chipRow(a: AppTheme, b: AppTheme) = LinearLayout(this).apply {
+        val spacer = View(this).apply { layoutParams = LinearLayout.LayoutParams(dp(64), dp(64)) .apply { setMargins(dp(14), 0, dp(14), 0) } }
+        val record = circleButton(104, R.drawable.ic_record, "Start or stop recording") { onRecordTapped() }
+        val flip = circleButton(64, R.drawable.ic_flip_camera, "Switch camera") { onSwitchTapped() }
+        recordBtn = record
+        switchBtn = flip
+
+        val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(themeChip(a))
-            addView(themeChip(b))
+            gravity = Gravity.CENTER
+            addView(spacer)
+            addView(record)
+            addView(flip)
         }
 
-        val column = LinearLayout(this).apply {
+        val top = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(24), dp(32), dp(24), dp(32))
+            gravity = Gravity.CENTER
             addView(title)
             addView(version)
-            addView(status)
-            addView(styledButton("Start recording", t.accent, t.onAccent) {
-                startRecordingWithPermissions()
-            })
-            addView(styledButton("Stop recording", t.card, t.text) {
-                sendToService(RecordingService.ACTION_STOP)
-                setStatus("Stopping...")
-            })
-            addView(styledButton("Battery settings (allow background)", t.card, t.text) {
-                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-            })
-            addView(styledButton("Check for updates", t.card, t.text) {
-                checkForUpdates(manual = true)
-            })
-            addView(themeLabel)
-            addView(chipRow(Themes.all[0], Themes.all[1]))
-            addView(chipRow(Themes.all[2], Themes.all[3]))
         }
 
-        setContentView(ScrollView(this).apply {
+        setContentView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
             setBackgroundColor(t.background)
-            isFillViewport = true
-            addView(column)
+            setPadding(dp(24), dp(48), dp(24), dp(48))
+            addView(top, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+            addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+            addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { setMargins(0, dp(16), 0, dp(40)) })
         })
+
+        shownRecording = null
+        refreshState()
     }
 
-    // ---------- Recording ----------
+    private fun setNotice(text: String?) {
+        notice = text
+        refreshState()
+    }
 
-    private fun startRecordingWithPermissions() {
+    private fun formatTime(totalSeconds: Long): String {
+        val h = totalSeconds / 3600
+        val m = (totalSeconds % 3600) / 60
+        val s = totalSeconds % 60
+        return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+    }
+
+    /** Keeps buttons and text in sync with the real recording state. */
+    private fun refreshState() {
+        val t = appTheme
+        val recording = RecordingService.isRunning
+        val facing = if (Prefs.cameraFacing(this) == "front") "Front camera" else "Rear camera"
+
+        if (shownRecording != recording) {
+            shownRecording = recording
+            recordBtn?.apply {
+                setImageResource(if (recording) R.drawable.ic_stop else R.drawable.ic_record)
+                setColorFilter(if (recording) Color.WHITE else t.onAccent)
+                background = oval(if (recording) Color.parseColor("#D64545") else t.accent)
+            }
+            switchBtn?.apply {
+                setColorFilter(t.text)
+                background = oval(t.card)
+                isEnabled = !recording
+                alpha = if (recording) 0.35f else 1f
+            }
+        }
+
+        statusView?.text = notice ?: if (recording) {
+            val start = RecordingService.startTime
+            if (start > 0) {
+                "Recording  ${formatTime((SystemClock.elapsedRealtime() - start) / 1000)}  ·  $facing"
+            } else {
+                "Starting..."
+            }
+        } else {
+            "$facing  ·  Ready"
+        }
+    }
+
+    // ---------- Buttons ----------
+
+    private fun onSwitchTapped() {
+        if (RecordingService.isRunning) return
+        notice = null
+        val next = if (Prefs.cameraFacing(this) == "front") "back" else "front"
+        Prefs.setCameraFacing(this, next)
+        refreshState()
+    }
+
+    private fun onRecordTapped() {
+        notice = null
+        if (RecordingService.isRunning) {
+            startService(Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_STOP))
+            refreshState()
+        } else {
+            requestPermissionsThenStart()
+        }
+    }
+
+    private fun requestPermissionsThenStart() {
         val needed = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= 33) needed += Manifest.permission.POST_NOTIFICATIONS
 
         val missing = needed.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missing.isEmpty()) {
-            sendToService(RecordingService.ACTION_START)
+        if (missing.isEmpty()) afterPermissions() else permissionLauncher.launch(missing.toTypedArray())
+    }
+
+    private fun afterPermissions() {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        val restricted = !pm.isIgnoringBatteryOptimizations(packageName)
+        if (restricted && !Prefs.batteryAsked(this)) {
+            // One-time tip: without this, some phones stop background recording.
+            Prefs.setBatteryAsked(this)
+            AlertDialog.Builder(this)
+                .setTitle("Keep recording in the background")
+                .setMessage("Set BG Recorder to \"Unrestricted\" (or \"Don't optimize\") so your phone doesn't stop the recording when the screen is off.")
+                .setPositiveButton("Open settings") { _, _ ->
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                }
+                .setNegativeButton("Skip") { _, _ -> startRecording() }
+                .show()
         } else {
-            permissionLauncher.launch(missing.toTypedArray())
+            startRecording()
         }
     }
 
-    private fun sendToService(action: String) {
-        val intent = Intent(this, RecordingService::class.java).setAction(action)
-        if (action == RecordingService.ACTION_START) {
-            ContextCompat.startForegroundService(this, intent)
-            setStatus("Recording... you can leave the app or turn the screen off.")
-        } else {
-            startService(intent)
-        }
+    private fun startRecording() {
+        val intent = Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_START)
+        ContextCompat.startForegroundService(this, intent)
+        refreshState()
     }
 
     // ---------- Updates ----------
 
-    private fun checkForUpdates(manual: Boolean) {
+    private fun checkForUpdates() {
         if (busy) return
         busy = true
-        if (manual) setStatus("Checking for updates...")
 
         worker.execute {
             var release: Updater.Release? = null
-            var error: String? = null
             try {
                 release = Updater.fetchLatest()
-            } catch (e: Exception) {
-                error = e.message ?: "Network error"
+            } catch (_: Exception) {
+                // No internet or GitHub unreachable: stay quiet, try again next time.
             }
 
             runOnUiThread {
                 busy = false
                 val latest = release
-                when {
-                    error != null -> if (manual) setStatus("Update check failed: $error")
-                    latest == null -> if (manual) setStatus("No published version found yet.")
-                    latest.versionCode <= Updater.installedVersionCode(this) ->
-                        if (manual) setStatus("You already have the latest version.")
-                    else -> showUpdateDialog(latest)
+                if (latest != null && latest.versionCode > Updater.installedVersionCode(this)) {
+                    showUpdateDialog(latest)
                 }
             }
         }
@@ -260,11 +311,11 @@ class MainActivity : ComponentActivity() {
 
     private fun startUpdate(release: Updater.Release) {
         if (RecordingService.isRunning) {
-            setStatus("Stop recording before updating.")
+            setNotice("Stop recording before updating.")
             return
         }
         if (!packageManager.canRequestPackageInstalls()) {
-            setStatus("Allow BG Recorder to install apps, then press Check for updates again.")
+            setNotice("Allow BG Recorder to install apps, then reopen the app to update.")
             startActivity(
                 Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
             )
@@ -272,21 +323,21 @@ class MainActivity : ComponentActivity() {
         }
 
         busy = true
-        setStatus("Downloading update... 0%")
+        setNotice("Downloading update... 0%")
         worker.execute {
             try {
                 val file = Updater.download(this, release.apkUrl) { percent ->
-                    runOnUiThread { setStatus("Downloading update... $percent%") }
+                    runOnUiThread { setNotice("Downloading update... $percent%") }
                 }
                 runOnUiThread {
                     busy = false
-                    setStatus("Opening installer...")
+                    setNotice(null)
                     Updater.install(this, file)
                 }
             } catch (e: Exception) {
                 runOnUiThread {
                     busy = false
-                    setStatus("Download failed: ${e.message}")
+                    setNotice("Download failed: ${e.message}")
                 }
             }
         }

@@ -44,6 +44,9 @@ object Themes {
         )
     )
 
+    /** The theme that comes after [current] in the list (wraps around). */
+    fun next(current: AppTheme): AppTheme = all[(all.indexOfFirst { it.id == current.id } + 1) % all.size]
+
     private const val PREFS = "settings"
     private const val KEY = "theme"
 

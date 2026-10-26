@@ -26,8 +26,10 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Size
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -95,14 +97,15 @@ class RecordingService : Service() {
 
         try {
             val cm = getSystemService(CAMERA_SERVICE) as CameraManager
-            val cameraId = cm.cameraIdList.first {
-                cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
-                    CameraCharacteristics.LENS_FACING_BACK
-            }
-            val sensorOrientation =
-                cm.getCameraCharacteristics(cameraId).get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            val wanted = if (Prefs.cameraFacing(this) == "front")
+                CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+            val cameraId = cm.cameraIdList.firstOrNull {
+                cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == wanted
+            } ?: cm.cameraIdList.first()
+            val characteristics = cm.getCameraCharacteristics(cameraId)
+            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
-            prepareRecorder(sensorOrientation)
+            prepareRecorder(sensorOrientation, pickVideoSize(characteristics))
 
             cm.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
@@ -127,7 +130,17 @@ class RecordingService : Service() {
         }
     }
 
-    private fun prepareRecorder(sensorOrientation: Int) {
+    /** Biggest 16:9 size up to 1080p that this camera supports for video. */
+    private fun pickVideoSize(characteristics: CameraCharacteristics): Size {
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val sizes = map?.getOutputSizes(MediaRecorder::class.java) ?: return Size(1920, 1080)
+        val allowed = sizes.filter { it.width <= 1920 && it.height <= 1080 }
+        return allowed.filter { it.width * 9 == it.height * 16 }.maxByOrNull { it.width * it.height }
+            ?: allowed.maxByOrNull { it.width * it.height }
+            ?: Size(1280, 720)
+    }
+
+    private fun prepareRecorder(sensorOrientation: Int, size: Size) {
         // Create the output file in Movies/BGRecorder (visible in the gallery).
         val name = "REC_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
         val values = ContentValues().apply {
@@ -146,7 +159,7 @@ class RecordingService : Service() {
         mr.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
         mr.setOutputFile(pfd!!.fileDescriptor)
         mr.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-        mr.setVideoSize(1920, 1080)
+        mr.setVideoSize(size.width, size.height)
         mr.setVideoFrameRate(30)
         mr.setVideoEncodingBitRate(10_000_000)
         mr.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
@@ -177,6 +190,7 @@ class RecordingService : Service() {
                         s.setRepeatingRequest(request, null, handler)
                         recorder?.start()
                         recording = true
+                        startTime = SystemClock.elapsedRealtime()
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to begin recording", e)
                         stopOnMain()
@@ -199,6 +213,7 @@ class RecordingService : Service() {
     private fun stopRecording() {
         if (!isRunning) return
         isRunning = false
+        startTime = 0L
 
         try { session?.stopRepeating() } catch (_: Exception) {}
         try { if (recording) recorder?.stop() } catch (e: RuntimeException) {
@@ -263,5 +278,9 @@ class RecordingService : Service() {
 
         @Volatile
         var isRunning = false
+
+        /** Moment the recording really began (0 while not recording). */
+        @Volatile
+        var startTime = 0L
     }
 }
